@@ -4,6 +4,7 @@ import os
 import sys
 import time
 import yaml
+import horovod.tensorflow as hvd
 
 from tensorflow.keras.optimizers.schedules import PiecewiseConstantDecay
 from voc_data import create_batch_generator
@@ -26,16 +27,20 @@ parser.add_argument('--num-epochs', default=120, type=int)
 parser.add_argument('--checkpoint-dir', default='checkpoints')
 parser.add_argument('--pretrained-type', default='base')
 parser.add_argument('--gpu-id', default='0')
-
 args = parser.parse_args()
 
-os.environ['CUDA_VISIBLE_DEVICES'] = args.gpu_id
+hvd.init()
+gpus = tf.config.experimental.list_physical_devices('GPU')
+for gpu in gpus:
+    tf.config.experimental.set_memory_growth(gpu, True)
+if gpus:
+    tf.config.experimental.set_visible_devices(gpus[hvd.local_rank()], 'GPU')
 
 NUM_CLASSES = 21
 
 
 @tf.function
-def train_step(imgs, gt_confs, gt_locs, ssd, criterion, optimizer):
+def train_step(imgs, gt_confs, gt_locs, ssd, criterion, optimizer, first_batch):
     with tf.GradientTape() as tape:
         confs, locs = ssd(imgs)
 
@@ -47,9 +52,13 @@ def train_step(imgs, gt_confs, gt_locs, ssd, criterion, optimizer):
         l2_loss = args.weight_decay * tf.math.reduce_sum(l2_loss)
         loss += l2_loss
 
+    # Horovod: add Horovod Distributed GradientTape.
+    tape = hvd.DistributedGradientTape(tape)
     gradients = tape.gradient(loss, ssd.trainable_variables)
     optimizer.apply_gradients(zip(gradients, ssd.trainable_variables))
-
+    if first_batch:
+        hvd.broadcast_variables(ssd.variables, root_rank=0)
+        hvd.broadcast_variables(optimizer.variables(), root_rank=0)
     return loss, conf_loss, loc_loss, l2_loss
 
 
@@ -92,7 +101,8 @@ if __name__ == '__main__':
     
     optimizer = tf.keras.optimizers.SGD(
         learning_rate=lr_fn,
-        momentum=args.momentum)
+        momentum=args.momentum
+    )
 
     train_log_dir = 'logs/train'
     val_log_dir = 'logs/val'
@@ -105,12 +115,13 @@ if __name__ == '__main__':
         avg_loc_loss = 0.0
         start = time.time()
         for i, (_, imgs, gt_confs, gt_locs) in enumerate(batch_generator):
+            flag = (epoch == 0 and i == 0)
             loss, conf_loss, loc_loss, l2_loss = train_step(
-                imgs, gt_confs, gt_locs, ssd, criterion, optimizer)
+                imgs, gt_confs, gt_locs, ssd, criterion, optimizer, first_batch=flag)
             avg_loss = (avg_loss * i + loss.numpy()) / (i + 1)
             avg_conf_loss = (avg_conf_loss * i + conf_loss.numpy()) / (i + 1)
             avg_loc_loss = (avg_loc_loss * i + loc_loss.numpy()) / (i + 1)
-            if (i + 1) % 50 == 0:
+            if (i + 1) % 50 == 0 and hvd.local_rank()==0:
                 print('Epoch: {} Batch {} Time: {:.2}s | Loss: {:.4f} Conf: {:.4f} Loc: {:.4f}'.format(
                     epoch + 1, i + 1, time.time() - start, avg_loss, avg_conf_loss, avg_loc_loss))
 
@@ -136,6 +147,6 @@ if __name__ == '__main__':
             tf.summary.scalar('conf_loss', avg_val_conf_loss, step=epoch)
             tf.summary.scalar('loc_loss', avg_val_loc_loss, step=epoch)
 
-        if (epoch + 1) % 10 == 0:
+        if (epoch + 1) % 10 == 0 and hvd.rank() == 0:
             ssd.save_weights(
                 os.path.join(args.checkpoint_dir, 'ssd_epoch_{}.h5'.format(epoch + 1)))
